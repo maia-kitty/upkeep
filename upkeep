@@ -88,7 +88,7 @@ def show_check(output, packages):
             detail(package["name"] + "  →  newer flake revision", "yellow")
         detail("Use --verbose for flake URLs and revision details.", "dim")
     else:
-        print(paint(f"  {len(packages)} package{'s' if len(packages) != 1 else ''} available", "green"))
+        print(paint(f"  {len(packages)} update{'s' if len(packages) != 1 else ''} available", "green"))
         width = max(30, min(shutil.get_terminal_size((88, 24)).columns - 6, 94))
         sizes = [width // 3, width // 3, width - 2 * (width // 3)]
         print(paint("  " + "  ".join(value.ljust(size) for value, size in zip(
@@ -124,6 +124,8 @@ class Source:
     privileged: bool = False
     codes: tuple = (0,)
     note: str = ""
+    refresh_codes: tuple = (0,)
+    key: str = ""  # matches its --no-<key> flag
 
 
 @dataclass
@@ -384,35 +386,49 @@ def nix_source(profile):
     return None
 
 
-def sources(args, info):
+def enabled(args, source):
+    return not (source.key and getattr(args, "no_" + source.key))
+
+
+def sources(args, info, keep_disabled=False):
+    """Every source found on this machine; --no-* sources only with keep_disabled."""
     result = []
     manager = backend(info) if args.backend == "auto" else args.backend
     native = native_source(manager, info)
     if native:
+        native.key = "system"
         result.append(native)
     elif args.backend == "auto":
         print("No supported system backend detected; checking additional package managers.")
-    if manager == "pacman" and not args.no_aur:
+    if manager == "pacman":
         helper = next((name for name in ("paru", "yay") if shutil.which(name)), None)
         if helper:
-            result.append(Source("AUR", [helper, "-Qua"], [helper, "-Sua"]))
-    if not args.no_flatpak and shutil.which("flatpak"):
+            result.append(Source("AUR", [helper, "-Qua"], [helper, "-Sua"], key="aur"))
+    if shutil.which("flatpak"):
         result.append(Source("Flatpak", ["flatpak", "remote-ls", "--updates",
                                          "--columns=application,version,branch,arch"],
-                             ["flatpak", "update"]))
-    if not args.no_nix and (shutil.which("nix") or shutil.which("nix-env")):
+                             ["flatpak", "update"], key="flatpak"))
+    if shutil.which("nix") or shutil.which("nix-env"):
         state = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state")))
         default = Path.home() / ".nix-profile"
         if not default.exists():
             default = state / "nix/profiles/profile"
         source = nix_source(args.nix_profile or default)
         if source:
+            source.key = "nix"
             result.append(source)
-        else:
+        elif not args.no_nix:
             print(f"Nix: no supported user profile at {args.nix_profile or default}.")
-        if VERBOSE:
+        if VERBOSE and not args.no_nix:
             detail("NixOS/Home Manager configurations and the Nix daemon are managed separately.", "dim")
-    return result
+    if shutil.which("fwupdmgr"):
+        # get-updates --json never prompts and exits 0; refresh exits 2 when metadata is current.
+        # fwupd asks polkit itself for installs, so it runs without sudo.
+        result.append(Source("Firmware (fwupd)", ["fwupdmgr", "get-updates", "--json"],
+                             ["fwupdmgr", "update"], ["fwupdmgr", "refresh"],
+                             note="Uses downloaded LVFS metadata; add --refresh for a fresh check.",
+                             refresh_codes=(0, 2), key="fwupd"))
+    return result if keep_disabled else [source for source in result if enabled(args, source)]
 
 
 def run(command, privileged=False, capture=False, timeout=None):
@@ -428,10 +444,23 @@ def run(command, privileged=False, capture=False, timeout=None):
     # Parsers need untranslated output; interactive transactions keep the user's locale.
     env = dict(os.environ, LC_ALL="C.UTF-8") if capture else None
     try:
-        return subprocess.run(command, env=env, text=True, timeout=timeout,
-                              stdin=subprocess.DEVNULL if capture and not privileged else None,
-                              stdout=subprocess.PIPE if capture else None,
-                              stderr=subprocess.STDOUT if capture else None)
+        if capture:
+            return subprocess.run(command, env=env, text=True, timeout=timeout,
+                                  stdin=subprocess.DEVNULL if not privileged else None,
+                                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        # The child gets the terminal's Ctrl+C itself; subprocess.run would SIGKILL
+        # it mid-transaction, so wait for it to finish or stop on its own terms.
+        child = subprocess.Popen(command)
+        interrupted = False
+        while True:
+            try:
+                code = child.wait()
+                break
+            except KeyboardInterrupt:
+                interrupted = True
+        if interrupted:
+            raise KeyboardInterrupt
+        return subprocess.CompletedProcess(command, code)
     except subprocess.TimeoutExpired as error:
         raise RuntimeError(f"{command[0]} timed out after {timeout}s.") from error
     except OSError as error:
@@ -454,7 +483,7 @@ def process(source, args):
         detail(source.note, "dim")
     if args.refresh and source.refresh:
         # Refresh may require a password. It never upgrades installed packages.
-        if run(source.refresh, source.privileged).returncode != 0:
+        if run(source.refresh, source.privileged).returncode not in source.refresh_codes:
             raise RuntimeError("Metadata refresh failed; skipping this source.")
     print(paint("  Checking for updates…", "dim"), flush=True)
     checked = run(source.check, capture=True, timeout=args.timeout)
@@ -545,6 +574,15 @@ def parsed_updates(source, output, exit_code):
                 line.strip().startswith(("warning:", "unpacking ", "copying path "))
                 for line in remaining.splitlines() if line.strip())):
             return []
+    elif program == "fwupdmgr":
+        # Returned as-is: two identical devices (e.g. twin SSDs) must not be merged.
+        try:
+            return [{"name": device.get("Name") or device.get("DeviceId", "unknown device"),
+                     "installed": device.get("Version"),
+                     "available": device["Releases"][0].get("Version"), "kind": "package"}
+                    for device in json.loads(output)["Devices"] if device.get("Releases")]
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None
     elif program == "nix-env":
         for old, new in re.findall(r"upgrading '([^']+)' to '([^']+)'", output):
             name, _, version = old.rpartition("-")
@@ -564,8 +602,8 @@ def json_report(args, available):
               "status": "unknown", "total": 0, "sources": [], "notes": [], "busy": False,
               "reboot": {"required": False, "reasons": []}}
     for source in available:
-        cached = source.check[0] in ("apt-get", "zypper", "apk", "nix-env")
-        item = {"name": source.name, "status": "error", "count": None,
+        cached = source.check[0] in ("apt-get", "zypper", "apk", "nix-env", "fwupdmgr")
+        item = {"name": source.name, "key": source.key, "status": "error", "count": None,
                 "packages": [], "cached": cached, "message": "", "warnings": []}
         try:
             checked = run(source.check, capture=True, timeout=args.timeout)
@@ -626,11 +664,14 @@ def check_json(args):
                 result = {"version": 1, "busy": True, "status": "busy", "sources": [],
                           "total": 0, "notes": ["An update or check is already running."]}
             else:
-                available = sources(args, distro())
+                found = sources(args, distro(), keep_disabled=True)
+                available = [source for source in found if enabled(args, source)]
                 discovery_notes = notes.getvalue().strip().splitlines()
                 with checkupdates_database(cache):
                     result = json_report(args, available)
                 result["notes"] = discovery_notes
+                # Disabled ones too, so a settings page can offer exactly these toggles.
+                result["detected"] = [{"key": source.key, "name": source.name} for source in found]
                 # Atomic replacement lets the widget restore the last check on reload.
                 with tempfile.NamedTemporaryFile(mode="w", dir=cache, delete=False) as state:
                     json.dump(result, state)
@@ -640,13 +681,19 @@ def check_json(args):
     return int(result["status"] == "error")
 
 
-def launch_updater():
-    terminal = shutil.which("foot")
-    if not terminal:
-        raise RuntimeError("Foot is not installed or is missing from PATH.")
+def launch_updater(args):
+    updater = [str(Path(__file__).resolve()), "--refresh", "--wait"] + [
+        "--no-" + key for key in ("system", "aur", "flatpak", "nix", "fwupd") if getattr(args, "no_" + key)]
+    if shutil.which("foot"):
+        command = [shutil.which("foot"), "--title", "Upkeep"] + updater
+    elif shutil.which("xdg-terminal-exec"):
+        # Freedesktop launcher: opens the user's default terminal with its own exec syntax.
+        command = [shutil.which("xdg-terminal-exec")] + updater
+    else:
+        raise RuntimeError("Install Foot or xdg-terminal-exec to open the updater.")
     # Detach the terminal so moving/disabling/reloading the widget cannot kill
     # an in-progress package transaction.
-    subprocess.Popen([terminal, "--title", "Upkeep", str(Path(__file__).resolve()), "--refresh", "--wait"],
+    subprocess.Popen(command,
                      start_new_session=True, stdin=subprocess.DEVNULL,
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return 0
@@ -902,8 +949,10 @@ def main():
     parser.add_argument("--backend", choices=("auto", "none", "pacman", "apt", "dnf", "zypper", "xbps", "apk"), default="auto")
     parser.add_argument("--nix-profile", help="Nix user profile to check/upgrade")
     parser.add_argument("--no-nix", action="store_true")
+    parser.add_argument("--no-system", action="store_true", help="skip the system package manager")
     parser.add_argument("--no-aur", action="store_true")
     parser.add_argument("--no-flatpak", action="store_true")
+    parser.add_argument("--no-fwupd", action="store_true")
     parser.add_argument("--timeout", type=int, default=180, help="seconds per check (default: 180)")
     parser.add_argument("--verbose", action="store_true", help="show commands and full check output")
     parser.add_argument("--maintenance", action="store_true", help="only check reboot/services; ask before restarting")
@@ -911,7 +960,7 @@ def main():
     parser.add_argument("--clean", action="store_true", help="only offer cache cleanup; combine with --check to preview")
     parser.add_argument("--no-cleanup", action="store_true", help="skip the cached-package cleanup step")
     parser.add_argument("--json", action="store_true", help="read-only background check as JSON; no prompts or cleanup")
-    parser.add_argument("--launch", action="store_true", help="open the interactive updater in a detached Foot window")
+    parser.add_argument("--launch", action="store_true", help="open the interactive updater in a detached terminal window")
     parser.add_argument("--wait", action="store_true", help="wait for Enter before closing the terminal")
     args = parser.parse_args()
     WAIT_ON_EXIT = args.wait and not args.json and not args.launch
@@ -925,7 +974,7 @@ def main():
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.launch:
-        return launch_updater()
+        return launch_updater(args)
     if args.json:
         VERBOSE = False
         return check_json(args)
@@ -957,14 +1006,14 @@ def main():
             print("No supported package sources found.", file=sys.stderr)
             return 1
         failed = False
-        system_current = True
+        system_current = not args.no_system
         with checkupdates_database(cache):
             for source in available:
                 if source.name == "AUR" and not system_current and not args.check:
                     # Arch does not support partial upgrades; AUR builds would link
-                    # against the outdated system libraries.
+                    # against the outdated system libraries (also when --no-system).
                     section(source.name)
-                    detail("Skipped: the system upgrade did not complete. Update the system first.", "yellow")
+                    detail("Skipped: AUR builds need an up-to-date system, and the system wasn't updated in this run.", "yellow")
                     continue
                 try:
                     current = process(source, args)
